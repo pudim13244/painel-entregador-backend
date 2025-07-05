@@ -199,6 +199,95 @@ app.post('/login', async (req, res) => {
   }
 });
 
+// Registro de entregador
+app.post('/register', async (req, res) => {
+  const { name, email, password, phone, cpf, address } = req.body;
+  
+  try {
+    // Validações básicas
+    if (!name || !email || !password) {
+      return res.status(400).json({ 
+        message: 'Nome, email e senha são obrigatórios' 
+      });
+    }
+
+    // Validar formato do email
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ 
+        message: 'Formato de email inválido' 
+      });
+    }
+
+    // Validar senha (mínimo 6 caracteres)
+    if (password.length < 6) {
+      return res.status(400).json({ 
+        message: 'A senha deve ter pelo menos 6 caracteres' 
+      });
+    }
+
+    // Verificar se o email já existe
+    const [existingUsers] = await pool.query(
+      'SELECT id FROM users WHERE email = ?', 
+      [email]
+    );
+
+    if (existingUsers.length > 0) {
+      return res.status(400).json({ 
+        message: 'Este email já está cadastrado' 
+      });
+    }
+
+    // Hash da senha
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    // Inserir novo usuário entregador
+    const [result] = await pool.query(
+      'INSERT INTO users (name, email, password, phone, cpfCnpj, address, role, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [name, email, hashedPassword, phone || null, cpf || null, address || null, 'DELIVERY', 'active']
+    );
+
+    const userId = result.insertId;
+
+    // Criar perfil de entregador
+    await pool.query(
+      'INSERT INTO delivery_profile (user_id) VALUES (?)',
+      [userId]
+    );
+
+    // Criar configurações de notificação padrão
+    await pool.query(
+      'INSERT INTO user_notification_settings (user_id) VALUES (?)',
+      [userId]
+    );
+
+    // Gerar token JWT
+    const token = jwt.sign(
+      { id: userId, email: email, role: 'DELIVERY' }, 
+      JWT_SECRET, 
+      { expiresIn: '24h' }
+    );
+
+    res.status(201).json({
+      message: 'Entregador cadastrado com sucesso!',
+      token,
+      user: {
+        id: userId,
+        name,
+        email,
+        role: 'DELIVERY'
+      }
+    });
+
+  } catch (err) {
+    console.error('Erro no registro:', err);
+    res.status(500).json({ 
+      message: 'Erro interno do servidor ao cadastrar entregador' 
+    });
+  }
+});
+
 // Perfil do entregador autenticado (GET e PUT)
 app.get('/profile', authenticateDelivery, async (req, res) => {
   const deliveryPersonId = req.user.id;
