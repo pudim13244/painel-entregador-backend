@@ -15,10 +15,15 @@ const cloudinary = require('cloudinary').v2;
 const app = express();
 app.use(express.json());
 
-// Configuração CORS mais permissiva para desenvolvimento
-app.use(cors({
+// Middleware para tratar requisições OPTIONS (preflight)
+app.options('*', cors());
+
+// Configuração CORS para desenvolvimento e produção
+const corsOptions = {
   origin: function (origin, callback) {
+    // Lista de origens permitidas
     const allowedOrigins = [
+      // Desenvolvimento local
       'http://localhost:8080',
       'http://localhost:8081',
       'http://localhost:3000',
@@ -32,10 +37,31 @@ app.use(cors({
       'http://127.0.0.1:5173',
       'http://127.0.0.1:5174',
       'http://localhost',
-      'http://127.0.0.1'
+      'http://127.0.0.1',
+      // Produção
+      'https://entregadoresquick.vmagenciadigital.com',
+      'https://www.entregadoresquick.vmagenciadigital.com'
     ];
-    if (!origin) return callback(null, true); // Permite requisições sem origem (ex: curl)
+    
+    // Adicionar origens da variável de ambiente se existir
+    if (process.env.CORS_ORIGINS) {
+      const envOrigins = process.env.CORS_ORIGINS.split(',');
+      allowedOrigins.push(...envOrigins);
+    }
+    
+    // Log para debug
+    console.log('Origem da requisição:', origin);
+    console.log('Origens permitidas:', allowedOrigins);
+    
+    // Permitir requisições sem origem (ex: curl, Postman)
+    if (!origin) {
+      console.log('Requisição sem origem permitida');
+      return callback(null, true);
+    }
+    
+    // Verificar se a origem está na lista permitida
     if (allowedOrigins.includes(origin)) {
+      console.log('Origem permitida:', origin);
       return callback(null, true);
     } else {
       console.log('Origem bloqueada pelo CORS:', origin);
@@ -43,9 +69,28 @@ app.use(cors({
     }
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  credentials: true,
+  optionsSuccessStatus: 200, // Para compatibilidade com alguns navegadores
+  preflightContinue: false,
+  maxAge: 86400 // Cache preflight por 24 horas
+};
+
+app.use(cors(corsOptions));
+
+// Middleware adicional para garantir que OPTIONS seja tratado corretamente
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin);
+  res.header('Access-Control-Allow-Credentials', true);
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(200);
+  } else {
+    next();
+  }
+});
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
@@ -661,17 +706,43 @@ app.post('/upload/profile-photo', authenticateDelivery, multer().single('photo')
   try {
     if (!req.file) return res.status(400).json({ message: 'Arquivo não enviado' });
 
+    const userId = req.user.id;
+
     // Upload para Cloudinary
-    const result = await cloudinary.uploader.upload_stream(
-      { folder: 'profile_photos' },
-      (error, result) => {
-        if (error) return res.status(500).json({ message: 'Erro no upload', error });
-        return res.json({ url: result.secure_url });
-      }
-    );
-    // Enviar o buffer da imagem
-    result.end(req.file.buffer);
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: 'profile_photos' },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      uploadStream.end(req.file.buffer);
+    });
+
+    // Salvar a URL no banco de dados
+    const photoUrl = result.secure_url;
+    
+    // Verificar se o perfil existe
+    const [profiles] = await pool.query('SELECT id FROM delivery_profile WHERE user_id = ?', [userId]);
+    
+    if (profiles.length === 0) {
+      // Criar novo perfil com a foto
+      await pool.query(
+        'INSERT INTO delivery_profile (user_id, photo_url) VALUES (?, ?)',
+        [userId, photoUrl]
+      );
+    } else {
+      // Atualizar perfil existente com a nova foto
+      await pool.query(
+        'UPDATE delivery_profile SET photo_url = ? WHERE user_id = ?',
+        [photoUrl, userId]
+      );
+    }
+
+    res.json({ url: photoUrl });
   } catch (err) {
+    console.error('Erro ao enviar foto:', err);
     res.status(500).json({ message: 'Erro ao enviar foto', error: err.message });
   }
 });
