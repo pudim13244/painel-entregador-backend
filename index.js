@@ -11,6 +11,9 @@ const { google } = require('googleapis');
 const mime = require('mime-types');
 const webpush = require('web-push');
 const cloudinary = require('cloudinary').v2;
+const http = require('http');
+const { Server } = require('socket.io');
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
@@ -97,6 +100,26 @@ const pool = mysql.createPool({
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
   database: process.env.DB_NAME || 'food_flight_delivery',
+});
+
+// Sempre que conectar ao banco, define o timezone
+async function setTimeZone() {
+  try {
+    await pool.query("SET time_zone = '-03:00'");
+    console.log('[DB] Timezone definido para -03:00');
+  } catch (err) {
+    console.error('[DB] Erro ao definir timezone:', err);
+  }
+}
+
+// Definir timezone ao iniciar
+setTimeZone();
+// Agendar para rodar a cada 3 horas
+setInterval(setTimeZone, 3 * 60 * 60 * 1000);
+
+// Garante timezone correto em toda nova conexão do pool
+pool.on('connection', function (connection) {
+  connection.query("SET time_zone = '-03:00'");
 });
 
 // Verifica e cria o campo phone se necessário
@@ -426,7 +449,7 @@ app.get('/orders/active', authenticateDelivery, async (req, res) => {
   const deliveryPersonId = req.user.id;
   try {
     const [orders] = await pool.query(`
-      SELECT o.id, o.status, o.created_at, u.address AS endereco, o.customer_id, u.name as customer_name, u.phone as customer_phone, o.establishment_id, ep.restaurant_name as establishment_name
+      SELECT o.id, o.status, o.created_at, u.address AS endereco, o.customer_id, u.name as customer_name, u.phone as customer_phone, o.establishment_id, ep.restaurant_name as establishment_name, o.total_amount AS value, o.payment_method
       FROM orders o
       JOIN users u ON o.customer_id = u.id
       JOIN establishment_profile ep ON o.establishment_id = ep.user_id
@@ -437,6 +460,32 @@ app.get('/orders/active', authenticateDelivery, async (req, res) => {
   } catch (err) {
     console.error('Erro SQL /orders/active:', err);
     res.status(500).json({ message: 'Erro ao buscar pedidos em andamento', error: err.message });
+  }
+});
+
+// Histórico de entregas finalizadas
+app.get('/orders/history', authenticateDelivery, async (req, res) => {
+  const deliveryPersonId = req.user.id;
+  try {
+    const [orders] = await pool.query(`
+      SELECT 
+        o.id,
+        o.created_at AS date,
+        ep.restaurant_name AS restaurant,
+        u.name AS customer,
+        o.total_amount AS value,
+        o.delivery_fee AS earning,
+        5 AS rating -- mock, ajuste se tiver avaliação real
+      FROM orders o
+      JOIN users u ON o.customer_id = u.id
+      JOIN establishment_profile ep ON o.establishment_id = ep.user_id
+      WHERE o.status = 'DELIVERED' AND o.delivery_id = ?
+      ORDER BY o.created_at DESC
+    `, [deliveryPersonId]);
+    res.json(orders);
+  } catch (err) {
+    console.error('Erro SQL /orders/history:', err);
+    res.status(500).json({ message: 'Erro ao buscar histórico de entregas', error: err.message });
   }
 });
 
@@ -466,36 +515,58 @@ app.post('/orders/:id/finish', authenticateDelivery, async (req, res) => {
     const [orders] = await pool.query('SELECT * FROM orders WHERE id = ? AND delivery_id = ? AND status = "DELIVERING"', [orderId, deliveryPersonId]);
     if (orders.length === 0) return res.status(403).json({ message: 'Pedido não pertence a este entregador ou não está em entrega' });
     await pool.query('UPDATE orders SET status = "DELIVERED" WHERE id = ?', [orderId]);
-    res.json({ message: 'Entrega finalizada com sucesso' });
-  } catch (err) {
-    console.error('Erro SQL /orders/:id/finish:', err);
-    res.status(500).json({ message: 'Erro ao finalizar entrega', error: err.message });
-  }
-});
 
-// Histórico de entregas finalizadas
-app.get('/orders/history', authenticateDelivery, async (req, res) => {
-  const deliveryPersonId = req.user.id;
-  try {
-    const [orders] = await pool.query(`
-      SELECT 
-        o.id,
-        o.created_at AS date,
-        ep.restaurant_name AS restaurant,
-        u.name AS customer,
-        o.total_amount AS value,
-        o.delivery_fee AS earning,
-        5 AS rating -- mock, ajuste se tiver avaliação real
+    // Buscar dados completos do pedido para preencher o histórico
+    const [orderData] = await pool.query(`
+      SELECT o.id as order_id, o.establishment_id, ep.restaurant_name as establishment_name, o.delivery_id, u.name as delivery_name, o.customer_id, c.name as customer_name, c.phone as customer_phone, o.delivery_address, o.total_amount, o.delivery_fee, o.created_at, o.payment_method
       FROM orders o
-      JOIN users u ON o.customer_id = u.id
       JOIN establishment_profile ep ON o.establishment_id = ep.user_id
-      WHERE o.status = 'DELIVERED' AND o.delivery_id = ?
-      ORDER BY o.created_at DESC
-    `, [deliveryPersonId]);
-    res.json(orders);
+      JOIN users u ON o.delivery_id = u.id
+      JOIN users c ON o.customer_id = c.id
+      WHERE o.id = ?
+    `, [orderId]);
+    const order = orderData[0];
+
+    // Buscar horário do MySQL (timezone correto)
+    const [[{ now: finishedAt }]] = await pool.query("SELECT NOW() as now");
+
+    // Verifica se já existe registro no histórico
+    const [historyRows] = await pool.query('SELECT * FROM delivery_history WHERE order_id = ?', [orderId]);
+    if (historyRows.length === 0) {
+      // Inserir novo registro
+      await pool.query(
+        `INSERT INTO delivery_history (order_id, establishment_id, establishment_name, delivery_id, delivery_name, customer_name, customer_phone, delivery_address, total_amount, delivery_fee, created_at, payment_method, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        , [order.order_id, order.establishment_id, order.establishment_name, order.delivery_id, order.delivery_name, order.customer_name, order.customer_phone, order.delivery_address, order.total_amount, order.delivery_fee, order.created_at, order.payment_method, finishedAt]
+      );
+    } else {
+      // Atualizar apenas campos faltantes
+      const updateFields = [];
+      const updateValues = [];
+      const row = historyRows[0];
+      if (!row.establishment_id) { updateFields.push('establishment_id = ?'); updateValues.push(order.establishment_id); }
+      if (!row.establishment_name) { updateFields.push('establishment_name = ?'); updateValues.push(order.establishment_name); }
+      if (!row.delivery_id) { updateFields.push('delivery_id = ?'); updateValues.push(order.delivery_id); }
+      if (!row.delivery_name) { updateFields.push('delivery_name = ?'); updateValues.push(order.delivery_name); }
+      if (!row.customer_name) { updateFields.push('customer_name = ?'); updateValues.push(order.customer_name); }
+      if (!row.customer_phone) { updateFields.push('customer_phone = ?'); updateValues.push(order.customer_phone); }
+      if (!row.delivery_address) { updateFields.push('delivery_address = ?'); updateValues.push(order.delivery_address); }
+      if (!row.total_amount) { updateFields.push('total_amount = ?'); updateValues.push(order.total_amount); }
+      if (!row.delivery_fee) { updateFields.push('delivery_fee = ?'); updateValues.push(order.delivery_fee); }
+      if (!row.created_at) { updateFields.push('created_at = ?'); updateValues.push(order.created_at); }
+      if (!row.payment_method) { updateFields.push('payment_method = ?'); updateValues.push(order.payment_method); }
+      if (!row.finished_at) { updateFields.push('finished_at = ?'); updateValues.push(finishedAt); }
+      if (updateFields.length > 0) {
+        await pool.query(
+          `UPDATE delivery_history SET ${updateFields.join(', ')} WHERE order_id = ?`,
+          [...updateValues, orderId]
+        );
+      }
+    }
+    res.json({ message: 'Pedido finalizado com sucesso!' });
   } catch (err) {
-    console.error('Erro SQL /orders/history:', err);
-    res.status(500).json({ message: 'Erro ao buscar histórico de entregas', error: err.message });
+    console.error('/orders/:id/finish erro:', err);
+    res.status(500).json({ message: 'Erro ao finalizar pedido' });
   }
 });
 
@@ -748,7 +819,33 @@ app.post('/upload/profile-photo', authenticateDelivery, multer().single('photo')
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
+
+// Mapa de conexões por entregador
+const entregadorSockets = new Map();
+
+io.on('connection', (socket) => {
+  // Recebe o id do entregador ao conectar
+  socket.on('registrar_entregador', (entregadorId) => {
+    entregadorSockets.set(entregadorId, socket.id);
+    socket.entregadorId = entregadorId;
+    console.log(`[WebSocket] Entregador conectado: ${entregadorId} (socket: ${socket.id})`);
+  });
+  socket.on('disconnect', () => {
+    if (socket.entregadorId) {
+      entregadorSockets.delete(socket.entregadorId);
+      console.log(`[WebSocket] Entregador desconectado: ${socket.entregadorId}`);
+    }
+  });
+});
+
+server.listen(PORT, () => {
   console.log(`QuickEntregadores - Backend rodando na porta ${PORT}`);
 }); 
 
@@ -830,46 +927,6 @@ app.get('/notifications/unread-count', authenticateDelivery, async (req, res) =>
   } catch (err) {
     console.error('Erro ao contar notificações não lidas:', err);
     res.status(500).json({ message: 'Erro ao contar notificações', error: err.message });
-  }
-});
-
-// Marcar notificação como lida
-app.post('/notifications/:id/read', authenticateDelivery, async (req, res) => {
-  const userId = req.user.id;
-  const notificationId = req.params.id;
-
-  try {
-    console.log('Marcando notificação como lida:', { userId, notificationId });
-    await pool.query(`
-      INSERT INTO user_notifications (user_id, notification_id, \`read\`, read_at)
-      VALUES (?, ?, 1, NOW())
-      ON DUPLICATE KEY UPDATE \`read\` = 1, read_at = NOW()
-    `, [userId, notificationId]);
-    console.log('Query executada com sucesso para marcar como lida');
-    res.json({ message: 'Notificação marcada como lida' });
-  } catch (err) {
-    console.error('Erro ao marcar notificação como lida:', err);
-    res.status(500).json({ message: 'Erro ao marcar notificação como lida', error: err.message });
-  }
-});
-
-// Marcar notificação como clicada
-app.post('/notifications/:id/click', authenticateDelivery, async (req, res) => {
-  const userId = req.user.id;
-  const notificationId = req.params.id;
-
-  try {
-    console.log('Marcando notificação como clicada:', { userId, notificationId });
-    await pool.query(`
-      INSERT INTO user_notifications (user_id, notification_id, \`clicked\`, clicked_at)
-      VALUES (?, ?, 1, NOW())
-      ON DUPLICATE KEY UPDATE \`clicked\` = 1, clicked_at = NOW()
-    `, [userId, notificationId]);
-    console.log('Query executada com sucesso para marcar como clicada');
-    res.json({ message: 'Notificação marcada como clicada' });
-  } catch (err) {
-    console.error('Erro ao marcar notificação como clicada:', err);
-    res.status(500).json({ message: 'Erro ao marcar notificação como clicada', error: err.message });
   }
 });
 
@@ -963,6 +1020,46 @@ app.put('/notifications/settings', authenticateDelivery, async (req, res) => {
   }
 });
 
+// Marcar notificação como lida
+app.post('/notifications/:id/read', authenticateDelivery, async (req, res) => {
+  const userId = req.user.id;
+  const notificationId = req.params.id;
+
+  try {
+    console.log('Marcando notificação como lida:', { userId, notificationId });
+    await pool.query(`
+      INSERT INTO user_notifications (user_id, notification_id, \`read\`, read_at)
+      VALUES (?, ?, 1, NOW())
+      ON DUPLICATE KEY UPDATE \`read\` = 1, read_at = NOW()
+    `, [userId, notificationId]);
+    console.log('Query executada com sucesso para marcar como lida');
+    res.json({ message: 'Notificação marcada como lida' });
+  } catch (err) {
+    console.error('Erro ao marcar notificação como lida:', err);
+    res.status(500).json({ message: 'Erro ao marcar notificação como lida', error: err.message });
+  }
+});
+
+// Marcar notificação como clicada
+app.post('/notifications/:id/click', authenticateDelivery, async (req, res) => {
+  const userId = req.user.id;
+  const notificationId = req.params.id;
+
+  try {
+    console.log('Marcando notificação como clicada:', { userId, notificationId });
+    await pool.query(`
+      INSERT INTO user_notifications (user_id, notification_id, \`clicked\`, clicked_at)
+      VALUES (?, ?, 1, NOW())
+      ON DUPLICATE KEY UPDATE \`clicked\` = 1, clicked_at = NOW()
+    `, [userId, notificationId]);
+    console.log('Query executada com sucesso para marcar como clicada');
+    res.json({ message: 'Notificação marcada como clicada' });
+  } catch (err) {
+    console.error('Erro ao marcar notificação como clicada:', err);
+    res.status(500).json({ message: 'Erro ao marcar notificação como clicada', error: err.message });
+  }
+});
+
 // ===== SISTEMA DE DISTRIBUIÇÃO AUTOMÁTICA DE PEDIDOS =====
 
 // Buscar ofertas de pedidos para o entregador
@@ -989,7 +1086,7 @@ app.get('/order-offers', authenticateDelivery, async (req, res) => {
       JOIN establishment_profile ep ON o.establishment_id = ep.user_id
       WHERE oo.deliveryman_id = ? 
       AND oo.status = 'pending'
-      AND oo.created_at > DATE_SUB(NOW(), INTERVAL 5 SECOND)
+      AND oo.created_at > DATE_SUB(NOW(), INTERVAL 20 SECOND)
       ORDER BY oo.created_at DESC
     `, [deliverymanId]);
 
@@ -1029,8 +1126,8 @@ app.post('/order-offers/:id/accept', authenticateDelivery, async (req, res) => {
     // Marcar oferta como aceita
     await pool.query('UPDATE order_offers SET status = ? WHERE id = ?', ['accepted', offerId]);
 
-    // Atribuir pedido ao entregador
-    await pool.query('UPDATE orders SET delivery_id = ? WHERE id = ?', [deliverymanId, offer.order_id]);
+    // Atribuir pedido ao entregador e mudar status para DELIVERING
+    await pool.query('UPDATE orders SET delivery_id = ?, status = "DELIVERING" WHERE id = ?', [deliverymanId, offer.order_id]);
 
     // Marcar outras ofertas do mesmo pedido como expiradas
     await pool.query('UPDATE order_offers SET status = ? WHERE order_id = ? AND id != ?', ['expired', offer.order_id, offerId]);
@@ -1065,6 +1162,7 @@ async function distributeOrders() {
   try {
     const dbName = process.env.DB_NAME || 'food_flight_delivery';
     console.log(`[distributeOrders] Usando banco: ${dbName}`);
+
     // Buscar pedidos prontos que não têm entregador atribuído
     const [readyOrders] = await pool.query(`
       SELECT 
@@ -1081,70 +1179,69 @@ async function distributeOrders() {
       JOIN users u ON o.customer_id = u.id
       WHERE o.status = 'READY' 
       AND (o.delivery_id IS NULL OR o.delivery_id = 0)
-      AND u.name NOT LIKE '%CONSUMO LOCAL%'
-      AND u.address NOT LIKE '%LOCAL%'
-      AND NOT EXISTS (
-        SELECT 1 FROM order_offers oo 
-        WHERE oo.order_id = o.id 
-        AND oo.status IN ('pending', 'accepted')
-      )
     `);
     console.log(`[distributeOrders] Pedidos prontos encontrados: ${readyOrders.length}`);
-    if (readyOrders.length > 0) {
-      readyOrders.forEach(o => {
-        console.log(`[distributeOrders] Pedido ID: ${o.id}, status: ${o.status}, delivery_id: ${o.delivery_id}`);
-      });
-    }
     if (readyOrders.length === 0) {
-      return; // Nenhum pedido pronto para distribuir
+      console.log(`[distributeOrders] ⏭️ Nenhum pedido pronto encontrado - saindo da função`);
+      return;
     }
 
-    // Buscar entregadores disponíveis ordenados por número de entregas
+    // Buscar todos os entregadores disponíveis
     const [deliverymen] = await pool.query(`
-      SELECT 
-        u.id,
-        u.name,
-        COUNT(o.id) as active_deliveries
+      SELECT u.id, u.name
       FROM users u
-      LEFT JOIN orders o ON u.id = o.delivery_id AND o.status IN ('IN_DELIVERY', 'PICKED_UP')
       WHERE u.role = 'DELIVERY'
-      GROUP BY u.id, u.name
-      ORDER BY active_deliveries ASC
     `);
-
     if (deliverymen.length === 0) {
-      return; // Nenhum entregador disponível
+      console.log(`[distributeOrders] ❌ ERRO: Nenhum entregador disponível no sistema`);
+      return;
     }
 
-    // Distribuir cada pedido
-    for (const order of readyOrders) {
-      let offered = false;
-      
-      // Tentar oferecer para cada entregador na ordem
-      for (const deliveryman of deliverymen) {
-        // Verificar se já existe oferta pendente para este pedido/entregador
-        const [existingOffers] = await pool.query(`
-          SELECT id FROM order_offers 
-          WHERE order_id = ? AND deliveryman_id = ? AND status = 'pending'
-        `, [order.id, deliveryman.id]);
-
-        if (existingOffers.length > 0) {
-          continue; // Já existe oferta pendente
-        }
-
-        // Criar oferta para este entregador
-        await pool.query(`
-          INSERT INTO order_offers (order_id, deliveryman_id, status) 
-          VALUES (?, ?, 'pending')
-        `, [order.id, deliveryman.id]);
-
-        console.log(`Oferta criada: Pedido ${order.id} para entregador ${deliveryman.name} (ID: ${deliveryman.id})`);
-        offered = true;
-        break; // Sair do loop de entregadores para este pedido
+    // Embaralhar pedidos e entregadores para garantir aleatoriedade
+    function shuffle(array) {
+      for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
       }
+      return array;
+    }
+    const shuffledOrders = shuffle([...readyOrders]);
+    const shuffledDeliverymen = shuffle([...deliverymen]);
 
-      if (!offered) {
-        console.log(`Não foi possível oferecer o pedido ${order.id} - nenhum entregador disponível`);
+    // Para cada pedido, buscar entregadores que ainda não receberam oferta
+    let deliverymenQueue = [...shuffledDeliverymen];
+    for (const order of shuffledOrders) {
+      // Buscar IDs dos entregadores que já receberam oferta para este pedido
+      const [alreadyOffered] = await pool.query(`
+        SELECT deliveryman_id FROM order_offers
+        WHERE order_id = ? AND status IN ('pending', 'expired', 'accepted', 'rejected')
+      `, [order.id]);
+      const alreadyOfferedIds = alreadyOffered.map(o => o.deliveryman_id);
+
+      // Filtrar entregadores que ainda não receberam oferta para este pedido
+      let availableDeliverymen = deliverymenQueue.filter(d => !alreadyOfferedIds.includes(d.id));
+      if (availableDeliverymen.length === 0) {
+        // Todos já receberam, limpa ofertas para recomeçar o ciclo
+        console.log(`[distributeOrders] Todos os entregadores já receberam oferta para o pedido ${order.id}. Limpando ofertas para recomeçar o ciclo.`);
+        await pool.query(`DELETE FROM order_offers WHERE order_id = ?`, [order.id]);
+        // Resetar fila para todos entregadores
+        availableDeliverymen = [...deliverymenQueue];
+      }
+      if (availableDeliverymen.length === 0) continue; // Nenhum disponível
+
+      // Selecionar o primeiro da fila para este pedido
+      const selected = availableDeliverymen[0];
+      // Remover esse entregador da fila para não receber outro pedido nesta rodada
+      deliverymenQueue = deliverymenQueue.filter(d => d.id !== selected.id);
+
+      // Criar oferta para o entregador
+      await criarOferta(order, selected);
+
+      console.log(`[distributeOrders] ✅ OFERTA CRIADA: Pedido ${order.id} (${order.restaurant_name} -> ${order.customer_name}) para entregador ${selected.name} (ID: ${selected.id})`);
+
+      // Se a fila de entregadores esvaziou, reinicia para próxima rodada
+      if (deliverymenQueue.length === 0) {
+        deliverymenQueue = [...shuffledDeliverymen];
       }
     }
   } catch (err) {
@@ -1152,26 +1249,236 @@ async function distributeOrders() {
   }
 }
 
-// Limpar ofertas expiradas (mais de 5 segundos)
+// Função para limpar ofertas expiradas usando hora local
 async function cleanupExpiredOffers() {
   try {
-    const [result] = await pool.query(`
-      UPDATE order_offers 
-      SET status = 'expired' 
-      WHERE status = 'pending' 
-      AND created_at < DATE_SUB(NOW(), INTERVAL 5 SECOND)
-    `);
-    
-    if (result.affectedRows > 0) {
-      console.log(`Limpeza: ${result.affectedRows} ofertas expiradas removidas`);
+    const now = Date.now();
+    // Buscar ofertas pendentes
+    const [offers] = await pool.query(`SELECT id, created_at FROM order_offers WHERE status = 'pending'`);
+    const expiredIds = offers.filter(o => (now - new Date(o.created_at).getTime()) > 20000).map(o => o.id);
+    if (expiredIds.length > 0) {
+      console.log(`[cleanupExpiredOffers] Excluindo ofertas expiradas:`, expiredIds);
+      await pool.query('DELETE FROM order_offers WHERE id IN (?)', [expiredIds]);
     }
   } catch (err) {
-    console.error('Erro ao limpar ofertas expiradas:', err);
+    console.error('[cleanupExpiredOffers] Erro ao excluir ofertas expiradas:', err);
   }
 }
 
+// Função para mostrar ofertas ativas
+async function showActiveOffers() {
+  try {
+    const [activeOffers] = await pool.query(`
+      SELECT 
+        oo.id,
+        oo.order_id,
+        oo.deliveryman_id,
+        oo.status,
+        oo.created_at,
+        u.name as deliveryman_name,
+        ep.restaurant_name,
+        c.name as customer_name
+      FROM order_offers oo
+      JOIN users u ON oo.deliveryman_id = u.id
+      JOIN orders o ON oo.order_id = o.id
+      JOIN establishment_profile ep ON o.establishment_id = ep.user_id
+      JOIN users c ON o.customer_id = c.id
+      WHERE oo.status = 'pending'
+      ORDER BY oo.created_at DESC
+    `);
+    
+    if (activeOffers.length > 0) {
+      console.log(`[showActiveOffers] Ofertas ativas no sistema:`);
+      activeOffers.forEach(offer => {
+        console.log(`[showActiveOffers] Oferta ID: ${offer.id}, Pedido: ${offer.order_id} (${offer.restaurant_name} -> ${offer.customer_name}), Entregador: ${offer.deliveryman_name} (ID: ${offer.deliveryman_id}), Criada: ${offer.created_at}`);
+      });
+    } else {
+      console.log(`[showActiveOffers] Nenhuma oferta ativa no sistema`);
+    }
+  } catch (err) {
+    console.error('Erro ao mostrar ofertas ativas:', err);
+  }
+}
+
+// Função para limpar ofertas antigas e duplicadas
+async function cleanupOldOffers() {
+  try {
+    // Limpar ofertas expiradas com mais de 1 hora
+    const [result] = await pool.query(`
+      DELETE FROM order_offers 
+      WHERE status = 'expired' 
+      AND created_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)
+    `);
+    
+    if (result.affectedRows > 0) {
+      console.log(`[cleanupOldOffers] Limpeza: ${result.affectedRows} ofertas antigas removidas`);
+    }
+    
+    // Limpar ofertas duplicadas (manter apenas a mais recente)
+    const [duplicateResult] = await pool.query(`
+      DELETE oo1 FROM order_offers oo1
+      INNER JOIN order_offers oo2 
+      WHERE oo1.id < oo2.id 
+      AND oo1.order_id = oo2.order_id 
+      AND oo1.deliveryman_id = oo2.deliveryman_id 
+      AND oo1.status = oo2.status
+      AND oo1.status = 'expired'
+    `);
+    
+    if (duplicateResult.affectedRows > 0) {
+      console.log(`[cleanupOldOffers] Limpeza: ${duplicateResult.affectedRows} ofertas duplicadas removidas`);
+    }
+  } catch (err) {
+    console.error('Erro ao limpar ofertas antigas:', err);
+  }
+}
+
+// Função para criar oferta para entregador, usando hora local
+async function criarOferta(order, selected) {
+  const now = Date.now();
+  const createdAt = new Date(now).toISOString().slice(0, 19).replace('T', ' '); // formato MySQL DATETIME
+  // Criar oferta para o entregador
+  const [result] = await pool.query(`
+    INSERT INTO order_offers (order_id, deliveryman_id, status, created_at)
+    VALUES (?, ?, 'pending', ?)
+  `, [order.id, selected.id, createdAt]);
+  const offerId = result.insertId;
+  // Logar no banco o tempo de expiração da oferta
+  await pool.query(`
+    INSERT INTO order_offer_logs (offer_id, order_id, deliveryman_id, expires_in_seconds)
+    VALUES (?, ?, ?, 20)
+  `, [offerId, order.id, selected.id]);
+  // Log detalhado no console
+  const nowStr = new Date(now).toISOString();
+  console.log(`[LOG OFERTA] ${nowStr} | Oferta criada: offer_id=${offerId}, pedido_id=${order.id}, entregador_id=${selected.id} (${selected.name}), expira_em=20s`);
+}
+
 // Iniciar jobs de distribuição automática
-setInterval(distributeOrders, 2000); // Executar a cada 2 segundos
-setInterval(cleanupExpiredOffers, 1000); // Limpar ofertas expiradas a cada 1 segundo
+setInterval(distributeOrders, 5000); // Executar a cada 5 segundos
+setInterval(cleanupExpiredOffers, 30000); // Limpar ofertas expiradas a cada 30 segundos
+setInterval(showActiveOffers, 60000); // Mostrar ofertas ativas a cada 60 segundos
+setInterval(cleanupOldOffers, 300000); // Limpar ofertas antigas a cada 5 minutos
+
+// Função para limpar ofertas expiradas e aceitas a cada 2 segundos
+async function cleanupOffersEvery2Seconds() {
+  try {
+    const now = Date.now();
+    
+    // Buscar ofertas pendentes para verificar expiração
+    const [pendingOffers] = await pool.query(`SELECT id, created_at FROM order_offers WHERE status = 'pending'`);
+    const expiredIds = pendingOffers.filter(o => (now - new Date(o.created_at).getTime()) > 20000).map(o => o.id);
+    
+    // Buscar ofertas aceitas para limpar
+    const [acceptedOffers] = await pool.query(`SELECT id FROM order_offers WHERE status = 'accepted'`);
+    const acceptedIds = acceptedOffers.map(o => o.id);
+    
+    // Combinar IDs para deletar
+    const idsToDelete = [...expiredIds, ...acceptedIds];
+    
+    if (idsToDelete.length > 0) {
+      console.log(`[cleanupOffersEvery2Seconds] Excluindo ofertas: ${expiredIds.length} expiradas, ${acceptedIds.length} aceitas`);
+      await pool.query('DELETE FROM order_offers WHERE id IN (?)', [idsToDelete]);
+    }
+  } catch (err) {
+    console.error('[cleanupOffersEvery2Seconds] Erro ao limpar ofertas:', err);
+  }
+}
+
+// Executar limpeza a cada 2 segundos
+setInterval(cleanupOffersEvery2Seconds, 2000);
 
 console.log('Sistema de distribuição automática de pedidos iniciado');
+
+// Loga a hora do servidor na inicialização
+console.log('[BOOT] Backend iniciado em', new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }), '| Timestamp:', Date.now());
+
+// Loga a hora do servidor a cada 40 minutos
+setInterval(() => {
+  const now = new Date();
+  console.log('[LOG HORA]', now.toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }), '| Timestamp:', now.getTime());
+}, 40 * 60 * 1000);
+
+// Criar tabela de log de ofertas se não existir
+async function ensureOrderOfferLogsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS order_offer_logs (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      offer_id INT,
+      order_id INT,
+      deliveryman_id INT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      expires_in_seconds INT
+    )
+  `);
+}
+ensureOrderOfferLogsTable();
+
+// Novo endpoint: Histórico de entregas do entregador logado
+app.get('/delivery-history', authenticateDelivery, async (req, res) => {
+  const deliveryPersonId = req.user.id;
+  try {
+    const [rows] = await pool.query(`
+      SELECT * FROM delivery_history WHERE delivery_id = ?
+    `, [deliveryPersonId]);
+    // Converter campos numéricos para número
+    const history = rows.map(row => ({
+      ...row,
+      delivery_fee: row.delivery_fee ? Number(row.delivery_fee) : 0,
+      total_amount: row.total_amount ? Number(row.total_amount) : 0,
+      created_at: row.created_at,
+      finished_at: row.finished_at
+    }));
+    res.json(history);
+  } catch (err) {
+    console.error('Erro ao buscar delivery_history:', err);
+    res.status(500).json({ message: 'Erro ao buscar histórico de entregas', error: err.message });
+  }
+});
+
+// Endpoint para faturamento total do dia e por estabelecimento
+app.get('/daily-earnings', async (req, res) => {
+  try {
+    const date = req.query.date || new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    // Buscar todos os registros do dia na tabela delivery_history
+    const [rows] = await pool.query(`
+      SELECT establishment_id, establishment_name, total_amount, delivery_fee, finished_at
+      FROM delivery_history
+      WHERE DATE(finished_at) = ?
+    `, [date]);
+
+    // Calcular totais gerais
+    let total_amount = 0;
+    let total_delivery_fee = 0;
+    const establishments = {};
+
+    for (const row of rows) {
+      const estId = row.establishment_id;
+      const estName = row.establishment_name;
+      const amount = Number(row.total_amount) || 0;
+      const fee = Number(row.delivery_fee) || 0;
+      total_amount += amount;
+      total_delivery_fee += fee;
+      if (!establishments[estId]) {
+        establishments[estId] = {
+          establishment_id: estId,
+          establishment_name: estName,
+          total_amount: 0,
+          total_delivery_fee: 0,
+          total_orders: 0
+        };
+      }
+      establishments[estId].total_amount += amount;
+      establishments[estId].total_delivery_fee += fee;
+      establishments[estId].total_orders += 1;
+    }
+
+    res.json({
+      total_amount,
+      total_delivery_fee,
+      establishments: Object.values(establishments)
+    });
+  } catch (err) {
+    console.error('/daily-earnings error:', err);
+    res.status(500).json({ message: 'Erro ao buscar faturamento do dia' });
+  }
+});
