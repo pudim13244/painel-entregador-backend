@@ -44,3 +44,16 @@ WHERE id = 4;
 -- Inserir configurações padrão para usuários entregadores existentes
 INSERT IGNORE INTO user_notification_settings (user_id)
 SELECT id FROM users WHERE role = 'DELIVERY'; 
+
+ALTER TABLE delivery_history ADD COLUMN taxa_recebida TINYINT(1) NOT NULL DEFAULT 0; 
+
+CREATE TABLE IF NOT EXISTS recebimentos (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  delivery_id INT NOT NULL,
+  total DECIMAL(10,2) NOT NULL,
+  status ENUM('pendente','confirmado','rejeitado') DEFAULT 'pendente',
+  codigo_confirmacao VARCHAR(12) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  pedidos_ids TEXT NOT NULL,
+  INDEX (delivery_id)
+); 

@@ -14,6 +14,7 @@ const cloudinary = require('cloudinary').v2;
 const http = require('http');
 const { Server } = require('socket.io');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -83,7 +84,9 @@ app.use(cors(corsOptions));
 
 // Middleware adicional para garantir que OPTIONS seja tratado corretamente
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', req.headers.origin);
+  // Forçar o origin local em desenvolvimento
+  const devOrigin = 'http://localhost:5173';
+  res.header('Access-Control-Allow-Origin', req.headers.origin || devOrigin);
   res.header('Access-Control-Allow-Credentials', true);
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
@@ -236,19 +239,40 @@ async function setupDatabase() {
 // Chama a função de setup ao iniciar o servidor
 setupDatabase();
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_key';
+const jwtSecret = process.env.JWT_SECRET || 'segredo_super_secreto';
 
-// Middleware de autenticação para entregador
+// Middleware de autenticação JWT
 function authenticateDelivery(req, res, next) {
+  console.log('🔐 [AUTH] ===== INÍCIO DO MIDDLEWARE =====');
+  console.log('🔐 [AUTH] Middleware chamado para:', req.method, req.originalUrl);
+  console.log('🔐 [AUTH] URL completa:', req.url);
+  console.log('🔐 [AUTH] Headers recebidos:', req.headers);
+  console.log('🔐 [AUTH] Authorization header:', req.headers['authorization']);
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ message: 'Token não fornecido' });
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ message: 'Token inválido' });
-    if (user.role !== 'DELIVERY') return res.status(403).json({ message: 'Acesso restrito a entregadores' });
-    req.user = user;
+  if (!authHeader) {
+    console.log('❌ [AUTH] Header Authorization não encontrado');
+    return res.status(401).json({ message: 'Token não fornecido' });
+  }
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    console.log('❌ [AUTH] Token não encontrado no header');
+    return res.status(401).json({ message: 'Token não fornecido' });
+  }
+  console.log('🔑 [AUTH] Token recebido:', token.substring(0, 20) + '...');
+  try {
+    const decoded = jwt.verify(token, jwtSecret);
+    console.log('✅ [AUTH] Token decodificado:', decoded);
+    req.user = decoded;
+    if (req.user.role !== 'DELIVERY') {
+      console.log('❌ [AUTH] Usuário não é entregador:', req.user.role);
+      return res.status(401).json({ message: 'Acesso negado' });
+    }
+    console.log('✅ [AUTH] Autenticação bem-sucedida para usuário:', req.user.id);
     next();
-  });
+  } catch (err) {
+    console.log('❌ [AUTH] Erro ao verificar token:', err.message);
+    return res.status(401).json({ message: 'Token inválido ou expirado' });
+  }
 }
 
 // Login do entregador
@@ -260,7 +284,7 @@ app.post('/login', async (req, res) => {
     const user = rows[0];
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(401).json({ message: 'Senha incorreta' });
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, jwtSecret, { expiresIn: '24h' });
     res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
   } catch (err) {
     res.status(500).json({ message: 'Erro interno do servidor' });
@@ -333,7 +357,7 @@ app.post('/register', async (req, res) => {
     // Gerar token JWT
     const token = jwt.sign(
       { id: userId, email: email, role: 'DELIVERY' }, 
-      JWT_SECRET, 
+      jwtSecret, 
       { expiresIn: '24h' }
     );
 
@@ -356,58 +380,81 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// Perfil do entregador autenticado (GET e PUT)
+// Endpoint para retornar perfil do entregador autenticado
 app.get('/profile', authenticateDelivery, async (req, res) => {
+  console.log('📡 [PROFILE] Endpoint /profile chamado - ANTES do middleware');
+  console.log('📡 [PROFILE] Headers da requisição:', req.headers);
+  console.log('📡 [PROFILE] Método:', req.method);
+  console.log('📡 [PROFILE] URL:', req.originalUrl);
   const deliveryPersonId = req.user.id;
   try {
     // Busca dados do usuário
     const [users] = await pool.query('SELECT id, name, email, phone FROM users WHERE id = ? AND role = "DELIVERY"', [deliveryPersonId]);
     if (users.length === 0) return res.status(404).json({ message: 'Entregador não encontrado' });
     const user = users[0];
+    
     // Busca dados do perfil
     const [profiles] = await pool.query('SELECT cpf, vehicle_type, vehicle_model, has_plate, plate, photo_url FROM delivery_profile WHERE user_id = ?', [deliveryPersonId]);
     const profile = profiles[0] || {};
-    res.json({ ...user, ...profile });
+    
+    // Busca dados de entregas (sem rating por enquanto)
+    const [stats] = await pool.query(`
+      SELECT 
+        COUNT(*) as totalDeliveries
+      FROM delivery_history 
+      WHERE delivery_id = ? AND finished_at IS NOT NULL
+    `, [deliveryPersonId]);
+    
+    const result = {
+      ...user,
+      ...profile,
+      rating: 0, // Rating não implementado ainda
+      totalDeliveries: stats[0]?.totalDeliveries || 0
+    };
+    
+    console.log('✅ [PROFILE] Dados retornados:', result);
+    res.json(result);
   } catch (err) {
-    console.error('Erro ao buscar perfil:', err);
+    console.error('❌ [PROFILE] Erro ao buscar perfil:', err);
     res.status(500).json({ message: 'Erro ao buscar perfil do entregador', error: err.message });
   }
 });
 
+// Endpoint para atualizar perfil do entregador
 app.put('/profile', authenticateDelivery, async (req, res) => {
   const deliveryPersonId = req.user.id;
   const { name, email, cpf, phone, vehicle_type, vehicle_model, has_plate, plate, photo_url } = req.body;
+  
   try {
-    // Atualiza dados básicos do usuário
+    // Atualizar dados do usuário
     await pool.query(
       'UPDATE users SET name = ?, email = ?, phone = ? WHERE id = ?',
       [name, email, phone, deliveryPersonId]
     );
-
-    // Verifica se já existe perfil
-    const [profiles] = await pool.query('SELECT id FROM delivery_profile WHERE user_id = ?', [deliveryPersonId]);
-    if (profiles.length === 0) {
-      // Cria novo perfil
-      await pool.query(
-        'INSERT INTO delivery_profile (user_id, cpf, vehicle_type, vehicle_model, has_plate, plate, photo_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [deliveryPersonId, cpf, vehicle_type, vehicle_model, has_plate, plate, photo_url]
-      );
-    } else {
-      // Atualiza perfil existente
+    
+    // Verificar se já existe perfil
+    const [existingProfile] = await pool.query('SELECT id FROM delivery_profile WHERE user_id = ?', [deliveryPersonId]);
+    
+    if (existingProfile.length > 0) {
+      // Atualizar perfil existente
       await pool.query(
         'UPDATE delivery_profile SET cpf = ?, vehicle_type = ?, vehicle_model = ?, has_plate = ?, plate = ?, photo_url = ? WHERE user_id = ?',
         [cpf, vehicle_type, vehicle_model, has_plate, plate, photo_url, deliveryPersonId]
       );
+    } else {
+      // Criar novo perfil
+      await pool.query(
+        'INSERT INTO delivery_profile (user_id, cpf, vehicle_type, vehicle_model, has_plate, plate, photo_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [deliveryPersonId, cpf, vehicle_type, vehicle_model, has_plate, plate, photo_url]
+      );
     }
-
-    // Busca dados atualizados para retornar
-    const [users] = await pool.query('SELECT id, name, email, phone FROM users WHERE id = ?', [deliveryPersonId]);
-    const [updatedProfile] = await pool.query('SELECT cpf, vehicle_type, vehicle_model, has_plate, plate, photo_url FROM delivery_profile WHERE user_id = ?', [deliveryPersonId]);
     
-    res.json({ 
-      ...users[0], 
-      ...(updatedProfile[0] || {})
-    });
+    // Retornar dados atualizados
+    const [users] = await pool.query('SELECT id, name, email, phone FROM users WHERE id = ?', [deliveryPersonId]);
+    const [profiles] = await pool.query('SELECT cpf, vehicle_type, vehicle_model, has_plate, plate, photo_url FROM delivery_profile WHERE user_id = ?', [deliveryPersonId]);
+    const profile = profiles[0] || {};
+    
+    res.json({ ...users[0], ...profile });
   } catch (err) {
     console.error('Erro ao atualizar perfil:', err);
     res.status(500).json({ message: 'Erro ao atualizar perfil do entregador', error: err.message });
@@ -446,6 +493,7 @@ app.get('/orders/available', authenticateDelivery, async (req, res) => {
 
 // Listar pedidos em andamento do entregador
 app.get('/orders/active', authenticateDelivery, async (req, res) => {
+  console.log('📡 [ACTIVE] Endpoint /orders/active chamado');
   const deliveryPersonId = req.user.id;
   try {
     const [orders] = await pool.query(`
@@ -456,15 +504,17 @@ app.get('/orders/active', authenticateDelivery, async (req, res) => {
       WHERE o.delivery_id = ? AND o.status NOT IN ('DELIVERED', 'CANCELLED')
       ORDER BY o.created_at ASC
     `, [deliveryPersonId]);
+    console.log('✅ [ACTIVE] Pedidos encontrados:', orders.length);
     res.json(orders);
   } catch (err) {
-    console.error('Erro SQL /orders/active:', err);
+    console.error('❌ [ACTIVE] Erro SQL /orders/active:', err);
     res.status(500).json({ message: 'Erro ao buscar pedidos em andamento', error: err.message });
   }
 });
 
 // Histórico de entregas finalizadas
 app.get('/orders/history', authenticateDelivery, async (req, res) => {
+  console.log('📡 [HISTORY] Endpoint /orders/history chamado');
   const deliveryPersonId = req.user.id;
   try {
     const [orders] = await pool.query(`
@@ -482,9 +532,10 @@ app.get('/orders/history', authenticateDelivery, async (req, res) => {
       WHERE o.status = 'DELIVERED' AND o.delivery_id = ?
       ORDER BY o.created_at DESC
     `, [deliveryPersonId]);
+    console.log('✅ [HISTORY] Pedidos encontrados:', orders.length);
     res.json(orders);
   } catch (err) {
-    console.error('Erro SQL /orders/history:', err);
+    console.error('❌ [HISTORY] Erro SQL /orders/history:', err);
     res.status(500).json({ message: 'Erro ao buscar histórico de entregas', error: err.message });
   }
 });
@@ -1480,5 +1531,181 @@ app.get('/daily-earnings', async (req, res) => {
   } catch (err) {
     console.error('/daily-earnings error:', err);
     res.status(500).json({ message: 'Erro ao buscar faturamento do dia' });
+  }
+});
+
+// Endpoint para faturamento total em um intervalo de datas
+app.get('/earnings-range', async (req, res) => {
+  try {
+    const startDate = req.query.start_date;
+    const endDate = req.query.end_date;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ message: 'Parâmetros start_date e end_date são obrigatórios (YYYY-MM-DD)' });
+    }
+    // Validar intervalo máximo de 31 dias
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const diff = (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24);
+    if (diff < 0) {
+      return res.status(400).json({ message: 'A data inicial deve ser menor ou igual à data final.' });
+    }
+    if (diff > 30) {
+      return res.status(400).json({ message: 'O intervalo máximo permitido é de 31 dias.' });
+    }
+    // Buscar todos os registros do período na tabela delivery_history
+    const [rows] = await pool.query(`
+      SELECT establishment_id, establishment_name, total_amount, delivery_fee, finished_at
+      FROM delivery_history
+      WHERE DATE(finished_at) BETWEEN ? AND ?
+    `, [startDate, endDate]);
+
+    // Calcular totais gerais
+    let total_amount = 0;
+    let total_delivery_fee = 0;
+    const establishments = {};
+
+    for (const row of rows) {
+      const estId = row.establishment_id;
+      const estName = row.establishment_name;
+      const amount = Number(row.total_amount) || 0;
+      const fee = Number(row.delivery_fee) || 0;
+      total_amount += amount;
+      total_delivery_fee += fee;
+      if (!establishments[estId]) {
+        establishments[estId] = {
+          establishment_id: estId,
+          establishment_name: estName,
+          total_amount: 0,
+          total_delivery_fee: 0,
+          total_orders: 0
+        };
+      }
+      establishments[estId].total_amount += amount;
+      establishments[estId].total_delivery_fee += fee;
+      establishments[estId].total_orders += 1;
+    }
+
+    res.json({
+      total_amount,
+      total_delivery_fee,
+      establishments: Object.values(establishments)
+    });
+  } catch (err) {
+    console.error('/earnings-range error:', err);
+    res.status(500).json({ message: 'Erro ao buscar faturamento do período' });
+  }
+});
+
+
+
+// Endpoint para listar estabelecimentos (pode ser público)
+app.get('/establishments', async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT DISTINCT u.id, ep.restaurant_name as name
+      FROM users u
+      INNER JOIN establishment_profile ep ON u.id = ep.user_id
+      WHERE u.role = 'ESTABLISHMENT' AND u.status = 'active'
+      ORDER BY ep.restaurant_name
+    `);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ message: 'Erro ao buscar estabelecimentos' });
+  }
+});
+
+// Listar pedidos do histórico para recebimento (recebidos ou não recebidos)
+app.get('/recebimentos/pedidos', authenticateDelivery, async (req, res) => {
+  const deliveryId = req.user.id;
+  const { status, estabelecimento_id, q } = req.query;
+  let where = 'delivery_id = ?';
+  let params = [deliveryId];
+  if (status === 'recebido') {
+    where += ' AND taxa_recebida = 1';
+  } else if (status === 'nao-recebido') {
+    where += ' AND taxa_recebida = 0';
+  }
+  if (estabelecimento_id) {
+    where += ' AND establishment_id = ?';
+    params.push(estabelecimento_id);
+  }
+  if (q) {
+    where += ' AND (order_id LIKE ? OR customer_name LIKE ? OR DATE(finished_at) = ?)';
+    params.push(`%${q}%`, `%${q}%`, q);
+  }
+  try {
+    const [pedidosRows] = await pool.query(
+      `SELECT id, order_id, establishment_id, customer_name, delivery_fee, taxa_recebida, finished_at FROM delivery_history WHERE ${where} ORDER BY finished_at DESC`,
+      params
+    );
+    res.json(pedidosRows);
+  } catch (err) {
+    res.status(500).json({ message: 'Erro ao buscar pedidos', error: err.message });
+  }
+});
+
+// Criar solicitação de recebimento
+app.post('/recebimentos/solicitar', authenticateDelivery, async (req, res) => {
+  const deliveryId = req.user.id;
+  const { pedidos_ids } = req.body; // array de IDs do delivery_history
+  if (!Array.isArray(pedidos_ids) || pedidos_ids.length === 0) {
+    return res.status(400).json({ message: 'Selecione ao menos um pedido' });
+  }
+  try {
+    // Buscar os pedidos e somar o valor das taxas
+    const [pedidos] = await pool.query(
+      `SELECT id, delivery_fee FROM delivery_history WHERE id IN (${pedidos_ids.map(() => '?').join(',')}) AND delivery_id = ? AND taxa_recebida = 0`,
+      [...pedidos_ids, deliveryId]
+    );
+    if (pedidos.length !== pedidos_ids.length) {
+      return res.status(400).json({ message: 'Alguns pedidos não encontrados ou já recebidos' });
+    }
+    const total = pedidos.reduce((sum, p) => sum + Number(p.delivery_fee), 0);
+    const codigo = crypto.randomBytes(4).toString('hex').toUpperCase();
+    // Inserir recebimento
+    const [insertResult] = await pool.query(
+      `INSERT INTO recebimentos (delivery_id, total, status, codigo_confirmacao, pedidos_ids) VALUES (?, ?, 'pendente', ?, ?)`,
+      [deliveryId, total, codigo, JSON.stringify(pedidos_ids)]
+    );
+    res.json({ id: insertResult.insertId, total, codigo, status: 'pendente' });
+  } catch (err) {
+    res.status(500).json({ message: 'Erro ao solicitar recebimento', error: err.message });
+  }
+});
+
+// Confirmar recebimento
+app.post('/recebimentos/confirmar', authenticateDelivery, async (req, res) => {
+  const deliveryId = req.user.id;
+  const { recebimento_id, codigo } = req.body;
+  if (!recebimento_id || !codigo) {
+    return res.status(400).json({ message: 'ID do recebimento e código são obrigatórios' });
+  }
+  try {
+    // Buscar recebimento
+    const [recebimentoRows] = await pool.query(
+      `SELECT * FROM recebimentos WHERE id = ? AND delivery_id = ? AND status = 'pendente'`,
+      [recebimento_id, deliveryId]
+    );
+    if (!recebimentoRows.length) {
+      return res.status(404).json({ message: 'Solicitação não encontrada ou já confirmada' });
+    }
+    const recebimento = recebimentoRows[0];
+    if (recebimento.codigo_confirmacao !== codigo) {
+      return res.status(400).json({ message: 'Código de confirmação inválido' });
+    }
+    // Atualizar status do recebimento
+    await pool.query(
+      `UPDATE recebimentos SET status = 'confirmado' WHERE id = ?`,
+      [recebimento_id]
+    );
+    // Marcar pedidos como recebidos
+    const pedidos_ids = JSON.parse(recebimento.pedidos_ids);
+    await pool.query(
+      `UPDATE delivery_history SET taxa_recebida = 1 WHERE id IN (${pedidos_ids.map(() => '?').join(',')})`,
+      pedidos_ids
+    );
+    res.json({ status: 'confirmado' });
+  } catch (err) {
+    res.status(500).json({ message: 'Erro ao confirmar recebimento', error: err.message });
   }
 });
