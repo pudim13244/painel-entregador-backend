@@ -84,7 +84,13 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Middleware adicional removido - estava causando conflito com o CORS
+// Middleware para aceitar rotas com prefixo /entregadoresquick
+app.use('/entregadoresquick', (req, res, next) => {
+  // Remove o prefixo /entregadoresquick da URL
+  req.url = req.url.replace('/entregadoresquick', '');
+  console.log('🔄 [PROXY] Rota com prefixo /entregadoresquick detectada, URL ajustada para:', req.url);
+  next();
+});
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
