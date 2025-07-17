@@ -58,7 +58,6 @@ const corsOptions = {
     // Log para debug
     console.log('🌐 [CORS] Origem da requisição:', origin);
     console.log('🌐 [CORS] Origens permitidas:', allowedOrigins);
-    console.log('🌐 [CORS] Headers da requisição:', req.headers);
     
     // Permitir requisições sem origem (ex: curl, Postman)
     if (!origin) {
@@ -68,10 +67,10 @@ const corsOptions = {
     
     // Verificar se a origem está na lista permitida
     if (allowedOrigins.includes(origin)) {
-      console.log('Origem permitida:', origin);
+      console.log('✅ [CORS] Origem permitida:', origin);
       return callback(null, true);
     } else {
-      console.log('Origem bloqueada pelo CORS:', origin);
+      console.log('❌ [CORS] Origem bloqueada:', origin);
       return callback(new Error('Not allowed by CORS'));
     }
   },
@@ -85,21 +84,7 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Middleware adicional para garantir que OPTIONS seja tratado corretamente
-app.use((req, res, next) => {
-  // Forçar o origin local em desenvolvimento
-  const devOrigin = 'http://localhost:5173';
-  res.header('Access-Control-Allow-Origin', req.headers.origin || devOrigin);
-  res.header('Access-Control-Allow-Credentials', true);
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  
-  if (req.method === 'OPTIONS') {
-    res.sendStatus(200);
-  } else {
-    next();
-  }
-});
+// Middleware adicional removido - estava causando conflito com o CORS
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
