@@ -44,7 +44,9 @@ const corsOptions = {
       'http://127.0.0.1',
       // Produção
       'https://entregadoresquick.vmagenciadigital.com',
-      'https://www.entregadoresquick.vmagenciadigital.com'
+      'https://www.entregadoresquick.vmagenciadigital.com',
+      'https://api.vmagenciadigital.com',
+      'https://www.api.vmagenciadigital.com'
     ];
     
     // Adicionar origens da variável de ambiente se existir
@@ -54,8 +56,9 @@ const corsOptions = {
     }
     
     // Log para debug
-    console.log('Origem da requisição:', origin);
-    console.log('Origens permitidas:', allowedOrigins);
+    console.log('🌐 [CORS] Origem da requisição:', origin);
+    console.log('🌐 [CORS] Origens permitidas:', allowedOrigins);
+    console.log('🌐 [CORS] Headers da requisição:', req.headers);
     
     // Permitir requisições sem origem (ex: curl, Postman)
     if (!origin) {
@@ -873,8 +876,15 @@ const PORT = process.env.PORT || 4000;
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
+    origin: [
+      'https://entregadoresquick.vmagenciadigital.com',
+      'https://www.entregadoresquick.vmagenciadigital.com',
+      'http://localhost:8080',
+      'http://localhost:3000',
+      'http://localhost:5173'
+    ],
+    methods: ['GET', 'POST'],
+    credentials: true
   }
 });
 
