@@ -1,0 +1,19 @@
+{
+  "metadata": {
+    "timestamp": "2025-07-20T01:32:37.444Z",
+    "database": "u328800108_food_fly",
+    "host": "srv1074.hstgr.io",
+    "totalOrders": 1,
+    "totalOffers": 1,
+    "totalItems": 4,
+    "totalHistory": 0,
+    "backupType": "metadata_only",
+    "note": "Backup otimizado - apenas contagens e metadados"
+  },
+  "counts": {
+    "orders": 1,
+    "order_offers": 1,
+    "order_items": 4,
+    "delivery_history": 0
+  }
+}
