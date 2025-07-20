@@ -19,6 +19,25 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
+// Middleware para proxy reverso (Nginx)
+app.use((req, res, next) => {
+  // Se estiver atrás de um proxy, confiar nos headers do proxy
+  if (req.headers['x-forwarded-for']) {
+    req.connection.remoteAddress = req.headers['x-forwarded-for'];
+  }
+  if (req.headers['x-forwarded-proto']) {
+    req.connection.encrypted = req.headers['x-forwarded-proto'] === 'https';
+  }
+  next();
+});
+
+// Middleware para lidar com subdiretório /entregadoresquick
+app.use('/entregadoresquick', (req, res, next) => {
+  // Remover /entregadoresquick do path para que as rotas funcionem
+  req.url = req.url.replace('/entregadoresquick', '');
+  next();
+});
+
 // Middleware para tratar requisições OPTIONS (preflight)
 app.options('*', cors());
 
@@ -869,13 +888,101 @@ app.post('/upload/profile-photo', authenticateDelivery, multer().single('photo')
   }
 });
 
+// Upload de foto do perfil do entregador
+app.post('/delivery-person/upload-photo', authenticateDelivery, multer().single('photo'), async (req, res) => {
+  const deliveryPersonId = req.user.id;
+  
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'Nenhuma foto foi enviada' });
+    }
+
+    // Configurar Cloudinary
+    cloudinary.config({
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+      api_key: process.env.CLOUDINARY_API_KEY,
+      api_secret: process.env.CLOUDINARY_API_SECRET
+    });
+
+    // Upload para Cloudinary
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      folder: 'delivery-photos',
+      public_id: `delivery_${deliveryPersonId}_${Date.now()}`,
+      transformation: [
+        { width: 400, height: 400, crop: 'fill' },
+        { quality: 'auto' }
+      ]
+    });
+
+    // Atualizar URL da foto no banco de dados
+    await pool.query(
+      'UPDATE delivery_profile SET photo_url = ? WHERE user_id = ?',
+      [result.secure_url, deliveryPersonId]
+    );
+
+    // Remover arquivo temporário
+    fs.unlinkSync(req.file.path);
+
+    res.json({ 
+      message: 'Foto atualizada com sucesso',
+      url: result.secure_url 
+    });
+  } catch (err) {
+    console.error('Erro ao fazer upload da foto:', err);
+    
+    // Remover arquivo temporário em caso de erro
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+    
+    res.status(500).json({ message: 'Erro ao fazer upload da foto', error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 4000;
 const server = http.createServer(app);
+
+// Middleware CORS específico para Socket.IO
+app.use('/socket.io/', (req, res, next) => {
+  res.header('Access-Control-Allow-Origin', 'https://entregadoresquick.vmagenciadigital.com');
+  res.header('Access-Control-Allow-Credentials', true);
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(200);
+  } else {
+    next();
+  }
+});
+
+// Middleware CORS específico para /entregadoresquick/socket.io/
+app.use('/entregadoresquick/socket.io/', (req, res, next) => {
+  res.header('Access-Control-Allow-Origin', 'https://entregadoresquick.vmagenciadigital.com');
+  res.header('Access-Control-Allow-Credentials', true);
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(200);
+  } else {
+    next();
+  }
+});
+
 const io = new Server(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+    origin: [
+      'https://entregadoresquick.vmagenciadigital.com',
+      'https://www.entregadoresquick.vmagenciadigital.com',
+      'http://localhost:5173',
+      'http://localhost:8080'
+    ],
+    methods: ['GET', 'POST'],
+    credentials: true
+  },
+  path: '/entregadoresquick/socket.io/',
+  allowEIO3: true
 });
 
 // Mapa de conexões por entregador
@@ -1145,6 +1252,73 @@ app.get('/order-offers', authenticateDelivery, async (req, res) => {
   } catch (err) {
     console.error('Erro ao buscar ofertas de pedidos:', err);
     res.status(500).json({ message: 'Erro ao buscar ofertas', error: err.message });
+  }
+});
+
+// Buscar ofertas ativas para todos os entregadores
+app.get('/order-offers/active', authenticateDelivery, async (req, res) => {
+  try {
+    const [offers] = await pool.query(`
+      SELECT 
+        oo.id as offer_id,
+        oo.order_id,
+        oo.status,
+        oo.created_at,
+        o.id as pedido_id,
+        o.status as order_status,
+        o.created_at as order_created_at,
+        u.name AS cliente,
+        u.phone AS telefone,
+        u.address AS endereco,
+        ep.restaurant_name AS estabelecimento,
+        CASE 
+          WHEN oo.created_at < DATE_SUB(NOW(), INTERVAL 15 SECOND) THEN 1 
+          ELSE 0 
+        END as expirada
+      FROM order_offers oo
+      JOIN orders o ON oo.order_id = o.id
+      JOIN users u ON o.customer_id = u.id
+      JOIN establishment_profile ep ON o.establishment_id = ep.user_id
+      WHERE oo.status = 'pending'
+      AND oo.created_at > DATE_SUB(NOW(), INTERVAL 20 SECOND)
+      ORDER BY oo.created_at DESC
+    `);
+
+    res.json(offers);
+  } catch (err) {
+    console.error('Erro ao buscar ofertas ativas:', err);
+    res.status(500).json({ message: 'Erro ao buscar ofertas', error: err.message });
+  }
+});
+
+// Buscar status das ofertas
+app.get('/order-offers/status', authenticateDelivery, async (req, res) => {
+  const deliverymanId = req.user.id;
+
+  try {
+    // Contar ofertas ativas do entregador
+    const [activeOffers] = await pool.query(`
+      SELECT COUNT(*) as active_offers
+      FROM order_offers oo
+      WHERE oo.deliveryman_id = ? 
+      AND oo.status = 'pending'
+      AND oo.created_at > DATE_SUB(NOW(), INTERVAL 15 SECOND)
+    `, [deliverymanId]);
+
+    const maxOffers = 3;
+    const activeCount = activeOffers[0].active_offers;
+    const canReceiveMore = activeCount < maxOffers;
+    const remainingSlots = Math.max(0, maxOffers - activeCount);
+
+    res.json({
+      active_offers: activeCount,
+      max_offers: maxOffers,
+      can_receive_more: canReceiveMore,
+      remaining_slots: remainingSlots
+    });
+  } catch (err) {
+    console.error('Erro ao buscar status das ofertas:', err);
+    res.status(500).json({ message: 'Erro ao buscar status', error: err.message });
   }
 });
 
@@ -1602,45 +1776,98 @@ app.get('/earnings-range', async (req, res) => {
 app.get('/establishments', async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT DISTINCT u.id, ep.restaurant_name as name
-      FROM users u
-      INNER JOIN establishment_profile ep ON u.id = ep.user_id
-      WHERE u.role = 'ESTABLISHMENT' AND u.status = 'active'
-      ORDER BY ep.restaurant_name
+      SELECT DISTINCT establishment_id, establishment_name 
+      FROM delivery_history 
+      WHERE establishment_id IS NOT NULL 
+      ORDER BY establishment_name
     `);
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ message: 'Erro ao buscar estabelecimentos' });
+    console.error('Erro ao buscar estabelecimentos:', err);
+    res.status(500).json({ message: 'Erro ao buscar estabelecimentos', error: err.message });
+  }
+});
+
+// Buscar estabelecimento específico
+app.get('/establishments/:id', async (req, res) => {
+  const establishmentId = req.params.id;
+  
+  try {
+    const [rows] = await pool.query(`
+      SELECT DISTINCT establishment_id, establishment_name 
+      FROM delivery_history 
+      WHERE establishment_id = ?
+    `, [establishmentId]);
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Estabelecimento não encontrado' });
+    }
+    
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Erro ao buscar estabelecimento:', err);
+    res.status(500).json({ message: 'Erro ao buscar estabelecimento', error: err.message });
   }
 });
 
 // Listar pedidos do histórico para recebimento (recebidos ou não recebidos)
 app.get('/recebimentos/pedidos', authenticateDelivery, async (req, res) => {
-  const deliveryId = req.user.id;
-  const { status, estabelecimento_id, q } = req.query;
-  let where = 'delivery_id = ?';
-  let params = [deliveryId];
-  if (status === 'recebido') {
-    where += ' AND taxa_recebida = 1';
-  } else if (status === 'nao-recebido') {
-    where += ' AND taxa_recebida = 0';
-  }
-  if (estabelecimento_id) {
-    where += ' AND establishment_id = ?';
-    params.push(estabelecimento_id);
-  }
-  if (q) {
-    where += ' AND (order_id LIKE ? OR customer_name LIKE ? OR DATE(finished_at) = ?)';
-    params.push(`%${q}%`, `%${q}%`, q);
-  }
+  const deliveryPersonId = req.user.id;
+  const { status, establishment_id } = req.query;
+  
   try {
-    const [pedidosRows] = await pool.query(
-      `SELECT id, order_id, establishment_id, customer_name, delivery_fee, taxa_recebida, finished_at FROM delivery_history WHERE ${where} ORDER BY finished_at DESC`,
-      params
-    );
-    res.json(pedidosRows);
+    let query = `
+      SELECT r.*, 
+             GROUP_CONCAT(dh.establishment_name) as establishment_names,
+             GROUP_CONCAT(dh.establishment_id) as establishment_ids
+      FROM recebimentos r
+      LEFT JOIN delivery_history dh ON FIND_IN_SET(dh.id, r.pedidos_ids)
+      WHERE r.delivery_id = ?
+    `;
+    
+    const params = [deliveryPersonId];
+    
+    if (status) {
+      query += ' AND r.status = ?';
+      params.push(status);
+    }
+    
+    if (establishment_id) {
+      query += ' AND dh.establishment_id = ?';
+      params.push(establishment_id);
+    }
+    
+    query += ' GROUP BY r.id ORDER BY r.created_at DESC';
+    
+    const [rows] = await pool.query(query, params);
+    
+    res.json(rows);
   } catch (err) {
-    res.status(500).json({ message: 'Erro ao buscar pedidos', error: err.message });
+    console.error('Erro ao buscar pedidos de recebimento:', err);
+    res.status(500).json({ message: 'Erro ao buscar pedidos de recebimento', error: err.message });
+  }
+});
+
+// Buscar recebimentos pendentes
+app.get('/recebimentos/pendentes', authenticateDelivery, async (req, res) => {
+  const deliveryPersonId = req.user.id;
+  
+  try {
+    const [rows] = await pool.query(`
+      SELECT r.*, 
+             GROUP_CONCAT(dh.establishment_name) as establishment_names,
+             GROUP_CONCAT(dh.establishment_id) as establishment_ids
+      FROM recebimentos r
+      LEFT JOIN delivery_history dh ON FIND_IN_SET(dh.id, r.pedidos_ids)
+      WHERE r.delivery_id = ? AND r.status = 'pendente'
+      GROUP BY r.id 
+      ORDER BY r.created_at DESC
+    `, [deliveryPersonId]);
+    
+    res.json(rows);
+  } catch (err) {
+    console.error('Erro ao buscar recebimentos pendentes:', err);
+    res.status(500).json({ message: 'Erro ao buscar recebimentos pendentes', error: err.message });
   }
 });
 
